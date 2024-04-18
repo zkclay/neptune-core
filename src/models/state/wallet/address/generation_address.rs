@@ -411,10 +411,17 @@ impl ReceivingAddress {
         let (hrp, data, variant) = bech32::decode(&encoded)?;
 
         if variant != Variant::Bech32m {
+            println!("~~~~~~~~~");
+            println!("Can only decode bech32m addresses.");
+            println!("~~~~~~~~~");
+
             bail!("Can only decode bech32m addresses.");
         }
 
         if hrp[0..=5] != Self::get_hrp(network) {
+            println!("~~~~~~~~~");
+            println!("Could not decode bech32m address because of invalid prefix");
+            println!("~~~~~~~~~");
             bail!("Could not decode bech32m address because of invalid prefix");
         }
 

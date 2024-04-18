@@ -192,6 +192,12 @@ pub async fn initialize(cli_args: cli_args::Args) -> Result<()> {
     }
     info!("Made outgoing connections to peers");
 
+    info!("~~~~~~~~");
+    for peer_address in global_state_lock.cli().peers.clone() {
+        println!("peer addr: {:?}", peer_address);
+    }
+    info!("~~~~~~~~");
+    
     // Start mining threads if requested
     let (miner_to_main_tx, miner_to_main_rx) = mpsc::channel::<MinerToMain>(MINER_CHANNEL_CAPACITY);
     let (main_to_miner_tx, main_to_miner_rx) = watch::channel::<MainToMiner>(MainToMiner::Empty);

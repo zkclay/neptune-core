@@ -82,6 +82,9 @@ fn make_block_template(
     let next_block_height = previous_block.kernel.header.height.next();
     if block_timestamp < previous_block.kernel.header.timestamp {
         warn!("Received block is timestamped in the future; mining on future-timestamped block.");
+        info!("~~~~~~~~");
+        info!("recieved block: {:?}", previous_block);
+        info!("~~~~~~~~~");
         block_timestamp = previous_block.kernel.header.timestamp + Timestamp::seconds(1);
     }
     let difficulty: U32s<5> = Block::difficulty_control(previous_block, block_timestamp);
