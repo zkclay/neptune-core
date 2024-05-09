@@ -121,3 +121,7 @@ harness = false
 [[bench]]
 name = "archival_mmr"
 harness = false
+
+[[bench]]
+name = "archival_mutator_set"
+harness = false
