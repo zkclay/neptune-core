@@ -6,7 +6,13 @@ use crate::util_types::mutator_set::{get_swbf_indices, MutatorSetError};
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 
+use crate::tasm_lib::DIGEST_LENGTH;
+use crate::util_types::mutator_set::archival_mutator_set::mmr::mmr_membership_proof::MmrMembershipProof;
+use crate::util_types::mutator_set::removal_record::AbsoluteIndexSet;
+use crate::util_types::mutator_set::shared::indices_to_hash_map;
 use itertools::Itertools;
+use num_traits::Zero;
+use tasm_lib::twenty_first::math::b_field_element::BFieldElement;
 use twenty_first::math::tip5::Digest;
 use twenty_first::util_types::algebraic_hasher::AlgebraicHasher;
 use twenty_first::util_types::mmr;
@@ -21,6 +27,8 @@ use super::ms_membership_proof::MsMembershipProof;
 use super::mutator_set_accumulator::MutatorSetAccumulator;
 use super::removal_record::RemovalRecord;
 use super::shared::{BATCH_SIZE, CHUNK_SIZE};
+
+use tasm_lib::twenty_first::prelude::Mmr;
 
 pub struct ArchivalMutatorSet<MmrStorage, ChunkStorage>
 where
@@ -44,23 +52,132 @@ where
         sender_randomness: Digest,
         receiver_preimage: Digest,
     ) -> MsMembershipProof {
-        MutatorSetAccumulator::new(
-            &self.aocl.get_peaks().await,
-            self.aocl.count_leaves().await,
-            &self.swbf_inactive.get_peaks().await,
-            &self.swbf_active.clone(),
-        )
-        .prove(item, sender_randomness, receiver_preimage)
+        //
+        let aocl_acc = self.aocl.to_accumulator_async().await;
+
+        // compute commitment
+        let item_commitment = Hash::hash_pair(item, sender_randomness);
+
+        // simulate adding to commitment list
+        let auth_path_aocl = aocl_acc.to_accumulator().append(item_commitment);
+        let target_chunks: ChunkDictionary = ChunkDictionary::default();
+
+        // return membership proof
+        MsMembershipProof {
+            sender_randomness: sender_randomness.to_owned(),
+            receiver_preimage: receiver_preimage.to_owned(),
+            auth_path_aocl,
+            target_chunks,
+        }
     }
 
     pub async fn verify(&self, item: Digest, membership_proof: &MsMembershipProof) -> bool {
-        let accumulator = self.accumulator().await;
-        accumulator.verify(item, membership_proof)
+        let accumulator: MmrAccumulator<Hash> =
+            MmrAccumulator::init(self.aocl.get_peaks().await, self.aocl.count_leaves().await);
+
+        // If data index does not exist in AOCL, return false
+        // This also ensures that no "future" indices will be
+        // returned from `get_indices`, so we don't have to check for
+        // future indices in a separate check.
+        if accumulator.count_leaves() <= membership_proof.auth_path_aocl.leaf_index {
+            return false;
+        }
+
+        // verify that a commitment to the item lives in the aocl mmr
+        let leaf = Hash::hash_pair(
+            Hash::hash_pair(item, membership_proof.sender_randomness),
+            Hash::hash_pair(
+                membership_proof.receiver_preimage,
+                Digest::new([BFieldElement::zero(); DIGEST_LENGTH]),
+            ),
+        );
+        let is_aocl_member = membership_proof.auth_path_aocl.verify(
+            &accumulator.get_peaks(),
+            leaf,
+            accumulator.count_leaves(),
+        );
+        if !is_aocl_member {
+            return false;
+        }
+
+        // verify that some indices are not present in the swbf
+        let mut has_absent_index = false;
+        let mut entries_in_dictionary = true;
+        let mut all_auth_paths_are_valid = true;
+
+        // prepare parameters of inactive part
+        let current_batch_index: u64 = self.get_batch_index_async().await.try_into().unwrap();
+        let window_start = current_batch_index as u128 * CHUNK_SIZE as u128;
+
+        // Get all bloom filter indices
+        let all_indices = AbsoluteIndexSet::new(&get_swbf_indices(
+            item,
+            membership_proof.sender_randomness,
+            membership_proof.receiver_preimage,
+            membership_proof.auth_path_aocl.leaf_index,
+        ));
+
+        let chunkidx_to_indices_dict = indices_to_hash_map(&all_indices.to_array());
+        'outer: for (chunk_index, indices) in chunkidx_to_indices_dict.into_iter() {
+            if chunk_index < current_batch_index {
+                // verify mmr auth path
+                if !membership_proof
+                    .target_chunks
+                    .dictionary
+                    .contains_key(&chunk_index)
+                {
+                    entries_in_dictionary = false;
+                    break 'outer;
+                }
+
+                let mp_and_chunk: &(MmrMembershipProof<Hash>, Chunk) = membership_proof
+                    .target_chunks
+                    .dictionary
+                    .get(&chunk_index)
+                    .unwrap();
+                let valid_auth_path = mp_and_chunk.0.verify(
+                    &self.swbf_inactive.get_peaks().await,
+                    Hash::hash(&mp_and_chunk.1),
+                    self.swbf_inactive.count_leaves().await,
+                );
+
+                all_auth_paths_are_valid = all_auth_paths_are_valid && valid_auth_path;
+
+                'inner_inactive: for index in indices {
+                    let index_within_chunk = index % CHUNK_SIZE as u128;
+                    if !mp_and_chunk.1.contains(index_within_chunk as u32) {
+                        has_absent_index = true;
+                        break 'inner_inactive;
+                    }
+                }
+            } else {
+                // indices are in active window
+                'inner_active: for index in indices {
+                    let relative_index = index - window_start;
+                    if !self.swbf_active.contains(relative_index as u32) {
+                        has_absent_index = true;
+                        break 'inner_active;
+                    }
+                }
+            }
+        }
+
+        // return verdict
+        is_aocl_member && entries_in_dictionary && all_auth_paths_are_valid && has_absent_index
     }
 
     pub async fn drop(&self, item: Digest, membership_proof: &MsMembershipProof) -> RemovalRecord {
-        let accumulator = self.accumulator().await;
-        accumulator.drop(item, membership_proof)
+        let indices: AbsoluteIndexSet = AbsoluteIndexSet::new(&get_swbf_indices(
+            item,
+            membership_proof.sender_randomness,
+            membership_proof.receiver_preimage,
+            membership_proof.auth_path_aocl.leaf_index,
+        ));
+
+        RemovalRecord {
+            absolute_indices: indices,
+            target_chunks: membership_proof.target_chunks.clone(),
+        }
     }
 
     pub async fn add(&mut self, addition_record: &AdditionRecord) {
